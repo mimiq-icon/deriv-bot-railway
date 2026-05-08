@@ -1,0 +1,11 @@
+*.db
+*.db-shm
+*.db-wal
+logs/
+models/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.*
+!.env.example

@@ -107,3 +107,4 @@ The bot uses the **new Deriv API v4** field names:
 
 **Termux killed the process**
 → Enable Termux:Boot, use a wake lock notification, or run on a VPS/Raspberry Pi instead.
+# v15 clean deploy Fri May  8 16:18:24 CAT 2026

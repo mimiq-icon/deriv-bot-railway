@@ -52,6 +52,8 @@ import numpy as np
 import pandas as pd
 import websockets
 from dotenv import load_dotenv
+import warnings
+warnings.filterwarnings("ignore", message=".*feature names.*", category=UserWarning)
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.model_selection import TimeSeriesSplit
@@ -60,6 +62,9 @@ from sklearn.utils.class_weight import compute_sample_weight
 
 try:
     import lightgbm as lgb  # type: ignore[import]
+    lgb.basic.LightGBMError  # ensure imported
+    import warnings
+    warnings.filterwarnings("ignore", message=".*feature names.*", category=UserWarning)
     _HAS_LGBM = True
 except ImportError:
     _HAS_LGBM = False

@@ -685,7 +685,7 @@ class GenesisBot:
         self._init_db()
 
         self.contracts = ContractStore(self._db)
-        self._model_dir = Path(_env("MODEL_DIR", "models_v14"))
+        self._model_dir = Path(_env("MODEL_DIR", "models_v15"))
         self._model_dir.mkdir(exist_ok=True)
 
         self._tg_session: aiohttp.ClientSession | None = None
@@ -1819,16 +1819,58 @@ class GenesisBot:
                         raise ConnectionError(f"Auth rejected: {err}")
                     log.info("[AUTH] Authenticated ✓")
 
-                    # ── Subscribe to balance ──
-                    await self._send(ws, {"balance": 1, "subscribe": 1})
-
-                    # ── Subscribe to open contract updates ──
-                    await self._send(ws, {"proposal_open_contract": 1, "subscribe": 1})
+                    # ── Subscribe to balance and sync live value synchronously ──
+                    # Using _request() instead of _send() so the first balance
+                    # response is captured before any trading logic runs.
+                    # The subscription stays active for ongoing updates via _on_balance.
+                    bal_resp = await self._request(
+                        ws, {"balance": 1, "subscribe": 1}, timeout=15.0
+                    )
+                    await self._on_balance(bal_resp)
+                    log.info("[BAL] Live balance synced: $%.2f", self.current_balance)
 
                     # ── Restore open contracts from DB ──
                     restored = self.contracts.load_from_db(self.processed_ids)
                     if restored:
-                        log.info("[RECONNECT] Restored %d open contract(s)", restored)
+                        log.info("[RECONNECT] Restored %d open contract(s) — "
+                                 "re-subscribing and checking for offline closes…", restored)
+                        closed_while_offline: list[tuple[str, dict]] = []
+                        for cid in list(self.contracts.all_ids()):
+                            try:
+                                # Subscribe for ongoing status events
+                                await self._send(ws, {
+                                    "proposal_open_contract": 1,
+                                    "contract_id": int(cid),
+                                    "subscribe": 1,
+                                })
+                                # One-shot snapshot to catch closes that happened
+                                # while the bot was disconnected.  This uses a
+                                # separate req_id so _listener resolves it here
+                                # rather than routing to _on_poc (avoiding double
+                                # processing); _handle_contract_close is idempotent
+                                # via processed_ids if both paths race.
+                                snap = await self._request(ws, {
+                                    "proposal_open_contract": 1,
+                                    "contract_id": int(cid),
+                                }, timeout=10.0)
+                                poc = snap.get("proposal_open_contract", {})
+                                if poc.get("status") in (
+                                    "sold", "won", "lost", "expired", "cancelled"
+                                ):
+                                    closed_while_offline.append((cid, poc))
+                            except Exception as exc:
+                                log.warning("[RECONNECT] Could not check contract %s: %s",
+                                            cid, exc)
+                        # Handle offline-closed contracts before starting signal loop
+                        for cid, poc in closed_while_offline:
+                            log.info(
+                                "[RECONNECT] Contract %s closed while offline "
+                                "(status=%s, profit=%s) — reconciling",
+                                cid, poc.get("status"), poc.get("profit"),
+                            )
+                            await self._handle_contract_close(cid, poc)
+                        log.info("[RECONNECT] Balance after reconciliation: $%.2f",
+                                 self.current_balance)
 
                     # ── Discover live multipliers from contracts_for ──
                     log.info("[INIT] Querying live multiplier values…")
@@ -1866,7 +1908,7 @@ class GenesisBot:
                         await asyncio.sleep(0.1)
 
                     await self._send_tg(
-                        f"🤖 Genesis v14 ONLINE | {ensemble}\n"
+                        f"🤖 Genesis v15 ONLINE | {ensemble}\n"
                         f"Deployed: {deployed}\n"
                         f"Bal: ${self.current_balance:.2f} | "
                         f"DD: {MAX_DRAWDOWN_PCT*100:.0f}%/{MAX_DAILY_LOSS_PCT*100:.0f}%"
@@ -1915,7 +1957,7 @@ class GenesisBot:
                          self.wins, self.losses, self.total_profit,
                          self._shutdown_reason or "user request")
                 await self._send_tg(
-                    f"🛑 Genesis v14 OFFLINE\n"
+                    f"🛑 Genesis v15 OFFLINE\n"
                     f"W:{self.wins} L:{self.losses} PnL:${self.total_profit:.2f}\n"
                     f"Reason: {self._shutdown_reason or 'user request'}"
                 )

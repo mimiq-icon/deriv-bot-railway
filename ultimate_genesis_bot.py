@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import random
+import re
 import sqlite3
 import sys
 import time
@@ -681,6 +682,7 @@ class GenesisBot:
         # Timing guards
         self.last_trade_time: float = 0.0
         self.symbol_last_trade: dict[str, float] = {s: 0.0 for s in self.all_symbols}
+        self._market_closed_until: dict[str, float] = {}  # loop.time() until which symbol is known-closed
         self.placing: set[str] = set()
 
         # Async infra
@@ -1525,6 +1527,8 @@ class GenesisBot:
             return
 
         now = asyncio.get_running_loop().time()
+        if now < self._market_closed_until.get(symbol, 0):
+            return  # Deriv told us this instrument is closed — wait it out silently
         if now - self.last_trade_time < GLOBAL_COOLDOWN:
             return
         if now - self.symbol_last_trade.get(symbol, 0) < SYMBOL_COOLDOWN:
@@ -1584,8 +1588,30 @@ class GenesisBot:
             resp = await self._request(ws, proposal_payload, timeout=15.0)
 
             if "error" in resp:
-                err = resp["error"].get("message", "?")
-                log.error("[ORDER] %s proposal error: %s", symbol, err)
+                err     = resp["error"].get("message", "?")
+                err_low = err.lower()
+                if "presently closed" in err_low or "market is closed" in err_low:
+                    # Parse "Market will open at YYYY-MM-DD HH:MM:SS" from the message.
+                    # Apply a cooldown so we stop hammering the API every second.
+                    wait_secs = 3600.0   # safe default: retry in 1 hour
+                    m = re.search(r"will open at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", err)
+                    if m:
+                        try:
+                            reopen_dt = datetime.strptime(
+                                m.group(1), "%Y-%m-%d %H:%M:%S"
+                            ).replace(tzinfo=timezone.utc)
+                            wait_secs = max(
+                                60.0,
+                                (reopen_dt - datetime.now(timezone.utc)).total_seconds() + 30,
+                            )
+                        except ValueError:
+                            pass
+                    loop = asyncio.get_running_loop()
+                    self._market_closed_until[symbol] = loop.time() + wait_secs
+                    log.info("[MARKET] %s closed — suppressing until reopen (~%.0f min)",
+                             symbol, wait_secs / 60)
+                else:
+                    log.error("[ORDER] %s proposal error: %s", symbol, err)
                 return
 
             proposal_obj = resp.get("proposal", {})

@@ -649,6 +649,12 @@ class GenesisBot:
         }
         self.symbol_streak: dict[str, int] = {s: 0 for s in self.all_symbols}
         self.new_candle_counts: dict[str, int] = {s: 0 for s in self.all_symbols}
+        # FIX: track the last OHLC open_time per symbol so we only count
+        # *closed* candles toward RETRAIN_EVERY, not every intra-candle tick.
+        # Deriv sends a new OHLC message on every price movement within the
+        # current minute (same open_time, updated high/low/close).  Without
+        # this guard, RETRAIN_EVERY=100 triggers in ~90 s instead of ~100 min.
+        self._last_ohlc_epoch: dict[str, int] = {}
         self._feature_cache: dict[str, dict[str, float]] = {}
         self._feature_names: dict[str, list[str]] = {}  # FIX: store feature names for named-DF prediction
 
@@ -1346,21 +1352,29 @@ class GenesisBot:
                 .sort_index()
             )
 
-        self.new_candle_counts[sym] = self.new_candle_counts.get(sym, 0) + 1
+        # Always clear feature cache so _get_signal uses the latest close price.
         self._feature_cache.pop(sym, None)
 
-        # Persist candle
+        # Persist the updated candle row every tick (keeps DB current).
         self._persist_candles(sym, new_row)
 
-        # Schedule retrain when enough new candles have arrived.
-        if self.new_candle_counts.get(sym, 0) >= RETRAIN_EVERY:
-            log.info("[RETRAIN] %s triggering retrain…", sym)
-            # Reset counter BEFORE creating the task so that candles arriving
-            # while training is in progress don't immediately re-trigger.
-            self.new_candle_counts[sym] = 0
-            task = asyncio.create_task(self.train_model(sym, ws))
-            self._retrain_tasks.add(task)
-            task.add_done_callback(self._retrain_tasks.discard)
+        # ── Retrain counter: only count closed candles, not intra-candle ticks ──
+        # Deriv sends a new OHLC message on every price movement, reusing the
+        # same open_time until the minute rolls over.  We must detect when the
+        # epoch CHANGES to know a new candle has actually closed.
+        prev_epoch = self._last_ohlc_epoch.get(sym, -1)
+        if epoch != prev_epoch:
+            self._last_ohlc_epoch[sym] = epoch
+            # Only increment and check retrain threshold on a genuine new candle.
+            self.new_candle_counts[sym] = self.new_candle_counts.get(sym, 0) + 1
+            if self.new_candle_counts.get(sym, 0) >= RETRAIN_EVERY:
+                log.info("[RETRAIN] %s triggering retrain…", sym)
+                # Reset counter BEFORE creating the task so that candles arriving
+                # while training is in progress don't immediately re-trigger.
+                self.new_candle_counts[sym] = 0
+                task = asyncio.create_task(self.train_model(sym, ws))
+                self._retrain_tasks.add(task)
+                task.add_done_callback(self._retrain_tasks.discard)
 
     async def _on_candles(self, msg: dict[str, Any]) -> None:
         """Handle bulk candle history response (initial subscription snapshot)."""

@@ -482,43 +482,54 @@ def confluence_score(row: dict[str, float], direction: str, regime: str) -> int:
     """
     direction = "UP" | "DOWN"
     Returns integer 0-5 representing how many sub-signals agree.
+
+    Previous version checked reversal-only conditions (RSI overbought, upper BB,
+    high stochastic) which systematically blocked trend-continuation and neutral-
+    momentum signals even when the ML ensemble had very high confidence.
+
+    Redesigned around DIRECTIONAL AGREEMENT across 5 independent perspectives,
+    each covering a different time horizon / price dimension.  A signal qualifies
+    regardless of whether it is a reversal or continuation setup:
+
+      1. MACD histogram  — short-term momentum oscillator
+      2. EMA ratio       — medium-term trend structure (EMA20 vs EMA50)
+      3. Price vs EMA20  — immediate price position relative to short trend
+      4. Raw momentum    — raw 10-bar price change direction
+      5. CCI             — 20-bar mean-deviation trend bias
+
+    All five checks are zero-threshold: they ask "does this indicator point the
+    same direction as the trade?" rather than "is this indicator at an extreme?"
+    This makes confluence complementary to the ML (which already uses levels and
+    extremes via its learned weights) rather than redundant with it.
+
+    MIN_CONFLUENCE=3 is unchanged — still requires majority agreement.
     """
     up = direction == "UP"
     score = 0
 
-    # 1. RSI
-    rsi = row.get("rsi14", 50)
-    if up and rsi < 40:
-        score += 1
-    elif not up and rsi > 60:
-        score += 1
-
-    # 2. EMA trend
-    ema_r = row.get("ema_ratio", 0)
-    if up and ema_r > 0:
-        score += 1
-    elif not up and ema_r < 0:
-        score += 1
-
-    # 3. MACD histogram
+    # 1. MACD histogram — short-term momentum direction
     mh = row.get("macd_hist", 0)
-    if up and mh > 0:
-        score += 1
-    elif not up and mh < 0:
+    if (up and mh > 0) or (not up and mh < 0):
         score += 1
 
-    # 4. Bollinger band position
-    bbp = row.get("bb_pos", 0.5)
-    if up and bbp < 0.3:
-        score += 1
-    elif not up and bbp > 0.7:
+    # 2. EMA trend structure — EMA20 vs EMA50 (medium-term bias)
+    ema_r = row.get("ema_ratio", 0)
+    if (up and ema_r > 0) or (not up and ema_r < 0):
         score += 1
 
-    # 5. Stochastic
-    sk = row.get("stoch_k", 50)
-    if up and sk < 30:
+    # 3. Price vs EMA20 — is price already on the right side of short trend?
+    pve = row.get("price_vs_ema20", 0)
+    if (up and pve > 0) or (not up and pve < 0):
         score += 1
-    elif not up and sk > 70:
+
+    # 4. Raw momentum — 10-bar price change confirms direction
+    mom = row.get("momentum", 0)
+    if (up and mom > 0) or (not up and mom < 0):
+        score += 1
+
+    # 5. CCI — 20-bar commodity channel index directional bias
+    cci = row.get("cci", 0)
+    if (up and cci > 0) or (not up and cci < 0):
         score += 1
 
     return score

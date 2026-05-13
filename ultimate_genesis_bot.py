@@ -1741,10 +1741,22 @@ class GenesisBot:
     # ── Contract lifecycle ────────────────────────────────────────────────────
 
     async def _on_poc(self, msg: dict[str, Any], ws: Any) -> None:
-        """Handle proposal_open_contract subscription updates."""
-        poc    = msg.get("proposal_open_contract", {})
-        status = poc.get("status", "")
-        if status in ("sold", "won", "lost", "expired", "cancelled"):
+        """Handle proposal_open_contract subscription updates.
+
+        For standard binary/vanilla contracts Deriv sets status='sold'/'won'/'lost'.
+        For MULTIPLIER contracts the status field stays 'open' throughout — the
+        close signal is is_sold=1 (set when SL/TP fires or the contract expires).
+        Both cases must be handled or _handle_contract_close never fires.
+        """
+        poc     = msg.get("proposal_open_contract", {})
+        status  = poc.get("status", "")
+        is_sold = int(poc.get("is_sold", 0))
+
+        is_closed = (
+            status in ("sold", "won", "lost", "expired", "cancelled")
+            or is_sold == 1
+        )
+        if is_closed:
             cid = str(poc.get("contract_id", ""))
             if cid:
                 await self._handle_contract_close(cid, poc)
@@ -1789,14 +1801,21 @@ class GenesisBot:
 
         total_wr = self.wins / max(1, self.wins + self.losses)
         sym_wr   = self._symbol_wr(symbol)
-        status   = poc.get("status", "?")
+        # For multiplier contracts the status stays "open" even when closed via
+        # SL/TP — is_sold=1 is the actual close signal.  Show a meaningful label.
+        raw_status = poc.get("status", "?")
+        if int(poc.get("is_sold", 0)) and raw_status == "open":
+            close_reason = poc.get("exit_tick_display_value") or "SL/TP"
+            display_status = f"sold ({close_reason})"
+        else:
+            display_status = raw_status
         sign     = "+" if won else ""
         outcome  = "✅ WIN" if won else "❌ LOSS"
         msg_text = (
             f"{outcome} | {symbol} {rec.contract_type}\n"
             f"P&L={sign}${profit:.2f} | Bal=${self.current_balance:.2f}\n"
             f"W:{self.wins} L:{self.losses} ({total_wr*100:.0f}%) | {symbol} WR={sym_wr*100:.0f}%\n"
-            f"Day=${self._daily_pnl:+.2f} | Status={status}"
+            f"Day=${self._daily_pnl:+.2f} | Status={display_status}"
         )
         log.info(msg_text.replace("\n", " | "))
         await self._send_tg(msg_text)
@@ -1974,9 +1993,13 @@ class GenesisBot:
                                     "contract_id": int(cid),
                                 }, timeout=10.0)
                                 poc = snap.get("proposal_open_contract", {})
-                                if poc.get("status") in (
-                                    "sold", "won", "lost", "expired", "cancelled"
-                                ):
+                                is_closed_snap = (
+                                    poc.get("status") in (
+                                        "sold", "won", "lost", "expired", "cancelled"
+                                    )
+                                    or int(poc.get("is_sold", 0)) == 1
+                                )
+                                if is_closed_snap:
                                     closed_while_offline.append((cid, poc))
                             except Exception as exc:
                                 log.warning("[RECONNECT] Could not check contract %s: %s",

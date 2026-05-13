@@ -150,6 +150,15 @@ MIN_CONFLUENCE: int    = _envi("MIN_CONFLUENCE", "3")       # signals out of 5
 CONF_THRESHOLD: float  = _envf("CONF_THRESHOLD", "0.52")   # model prob threshold
 MIN_KELLY: float       = _envf("MIN_KELLY", "0.02")         # min Kelly fraction
 
+# High-confidence confluence bypass.
+# When BOTH thresholds are met, the confluence gate is skipped — the ML ensemble
+# is trusted directly.  Simple directional sub-signals cannot capture non-obvious
+# patterns (e.g. extreme-oversold continuation) that a high-OOS model has learned.
+# Directional confluence still applies for moderate-confidence signals.
+# Set either to 1.0 in Railway Variables to disable the bypass entirely.
+HIGH_CONF_BYPASS_PROB: float = _envf("HIGH_CONF_BYPASS_PROB", "0.90")  # prob ≥ this
+HIGH_CONF_BYPASS_OOS:  float = _envf("HIGH_CONF_BYPASS_OOS",  "0.70")  # OOS ≥ this
+
 # Win-rate Bayesian prior
 WR_WINDOW: int          = 20
 WR_PRIOR: float         = 0.55
@@ -1489,7 +1498,17 @@ class GenesisBot:
                  feat_row.get("rsi14", 0), feat_row.get("adx", 0),
                  regime, oos * 100)
 
-        if conf < MIN_CONFLUENCE:
+        # High-confidence bypass: when the model is both highly confident AND
+        # well-validated out-of-sample, trust it directly.  Directional sub-signals
+        # are cruder tools that can't capture complex patterns (e.g. extreme-oversold
+        # continuation after a bounce) that a high-OOS ensemble has learned.
+        high_conf_bypass = (prob >= HIGH_CONF_BYPASS_PROB and oos >= HIGH_CONF_BYPASS_OOS)
+        if high_conf_bypass:
+            log.info("[SIGNAL] %s | HIGH_CONF bypass (prob=%.2f≥%.2f, OOS=%.1f%%≥%.0f%%) "
+                     "— skipping confluence gate",
+                     symbol, prob, HIGH_CONF_BYPASS_PROB, oos * 100,
+                     HIGH_CONF_BYPASS_OOS * 100)
+        elif conf < MIN_CONFLUENCE:
             log.info("[SKIP] %s confluence %d < %d", symbol, conf, MIN_CONFLUENCE)
             return None
 

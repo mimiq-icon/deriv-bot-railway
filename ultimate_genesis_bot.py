@@ -55,6 +55,8 @@ import websockets
 from dotenv import load_dotenv
 import warnings
 warnings.filterwarnings("ignore", message=".*feature names.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*single label.*",  category=UserWarning)
+warnings.filterwarnings("ignore", message=".*y_pred contains classes.*", category=UserWarning)
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.model_selection import TimeSeriesSplit
@@ -1585,15 +1587,28 @@ class GenesisBot:
                 #   Reason: mutually exclusive with limit_order per API schema
             }
 
-            resp = await self._request(ws, proposal_payload, timeout=15.0)
+            # ── PROPOSAL REQUEST (with one auto-retry for minimum-SL adjustment) ──
+            # Deriv's minimum stop_loss for multiplier contracts scales with the
+            # current price level of the instrument (e.g. GBPUSD 800x minimum SL
+            # rises as GBP appreciates).  On first rejection we parse the minimum
+            # from the error message and retry once with the adjusted SL.
+            proposal_id: str | None = None
+            ask_price: float = stake
+            for _attempt in range(2):
+                resp = await self._request(ws, proposal_payload, timeout=15.0)
 
-            if "error" in resp:
+                if "error" not in resp:
+                    proposal_obj = resp.get("proposal", {})
+                    proposal_id  = proposal_obj.get("id")
+                    ask_price    = _norm2(float(proposal_obj.get("ask_price", stake)))
+                    break
+
                 err     = resp["error"].get("message", "?")
                 err_low = err.lower()
+
+                # ── Market closed ────────────────────────────────────────────
                 if "presently closed" in err_low or "market is closed" in err_low:
-                    # Parse "Market will open at YYYY-MM-DD HH:MM:SS" from the message.
-                    # Apply a cooldown so we stop hammering the API every second.
-                    wait_secs = 3600.0   # safe default: retry in 1 hour
+                    wait_secs = 3600.0
                     m = re.search(r"will open at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", err)
                     if m:
                         try:
@@ -1610,17 +1625,37 @@ class GenesisBot:
                     self._market_closed_until[symbol] = loop.time() + wait_secs
                     log.info("[MARKET] %s closed — suppressing until reopen (~%.0f min)",
                              symbol, wait_secs / 60)
-                else:
-                    log.error("[ORDER] %s proposal error: %s", symbol, err)
+                    return
+
+                # ── Minimum amount / SL below Deriv floor ───────────────────
+                # "Enter an amount equal to or higher than X.XX"
+                # The minimum stop_loss for multiplier contracts scales with the
+                # current instrument price.  Parse X, bump the SL to that
+                # minimum (+1 cent buffer), and retry the proposal once.
+                if _attempt == 0 and (
+                    "equal to or higher than" in err or "enter an amount" in err_low
+                ):
+                    m2 = re.search(r"(\d+\.\d+)", err)
+                    if m2:
+                        min_val = float(m2.group(1))
+                        new_sl  = _norm2(min_val + 0.01)
+                        if new_sl < stake:      # sanity: SL must be below stake
+                            log.info(
+                                "[ORDER] %s SL $%.2f below Deriv minimum $%.2f "
+                                "— adjusting to $%.2f and retrying",
+                                symbol, proposal_payload["limit_order"]["stop_loss"],
+                                min_val, new_sl,
+                            )
+                            proposal_payload["limit_order"]["stop_loss"] = new_sl
+                            continue    # retry with adjusted SL
+
+                # ── All other errors ─────────────────────────────────────────
+                log.error("[ORDER] %s proposal error: %s", symbol, err)
                 return
 
-            proposal_obj = resp.get("proposal", {})
-            proposal_id  = proposal_obj.get("id")
             if not proposal_id:
                 log.error("[ORDER] %s — no proposal ID in response", symbol)
                 return
-
-            ask_price = _norm2(float(proposal_obj.get("ask_price", stake)))
 
             # ── BUY REQUEST ──────────────────────────────────────────────────
             # Field reference: developers.deriv.com/schemas/buy_request.schema.json
@@ -1661,6 +1696,16 @@ class GenesisBot:
             )
             self.contracts.add(rec)
 
+            # ── Subscribe to live updates for this contract ───────────────────
+            # Without this, the bot never receives the close event (SL/TP hit),
+            # _handle_contract_close never fires, the contract stays in
+            # self.contracts forever, and MAX_OPEN blocks all future trades.
+            await self._send(ws, {
+                "proposal_open_contract": 1,
+                "contract_id": int(contract_id),
+                "subscribe": 1,
+            })
+
             oos = self.model_oos.get(symbol, 0.0)
             msg_text = (
                 f"🚀 TRADE | {symbol} {contract_type}\n"
@@ -1698,7 +1743,12 @@ class GenesisBot:
         profit = float(poc.get("profit", 0.0))
         symbol = rec.symbol
         self.total_profit  += profit
-        self.current_balance = float(poc.get("account_balance", self.current_balance))
+        # Use account_balance from the close event when available; if Deriv
+        # omits it (some contract types don't include it), the balance
+        # subscription stream keeps self.current_balance current anyway.
+        new_bal = poc.get("account_balance")
+        if new_bal is not None:
+            self.current_balance = float(new_bal)
         self.contracts.remove(cid)
 
         won = profit > 0

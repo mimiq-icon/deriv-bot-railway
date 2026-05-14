@@ -930,9 +930,18 @@ class GenesisBot:
         return self.current_balance * STAKE_LADDER[0][1]
 
     def _calculate_stake(self, symbol: str, prob: float) -> float:
-        wr   = self._symbol_wr(symbol)
-        odds = 1.0   # even payout for multipliers (approximation)
-        kelly = (wr * (1 + odds) - 1) / odds   # fractional Kelly
+        # ── Kelly Criterion ───────────────────────────────────────────────────
+        # Kelly needs the win probability for THIS specific trade.
+        # Using historical symbol WR (old approach) is wrong: after a few losses
+        # WR collapses toward 0, Kelly goes negative, stake freezes at zero even
+        # when the ML is still 99% confident.  The model's output probability IS
+        # the best available estimate of win probability — it was trained and
+        # OOS-validated on thousands of examples for exactly this purpose.
+        # Stake therefore scales dynamically with signal confidence on every trade.
+        _sl = float(_env(f"SL_PCT_{symbol}", _env("SL_PCT", "0.50")))
+        _tp = float(_env(f"TP_PCT_{symbol}", _env("TP_PCT", "1.00")))
+        odds  = _tp / max(_sl, 1e-6)            # e.g. 1.0/0.5 = 2.0
+        kelly = (prob * (1 + odds) - 1) / odds  # Kelly with model probability
         kelly = max(kelly, 0.0)
 
         # Scale down to risk percent
@@ -979,9 +988,14 @@ class GenesisBot:
             X_val_s = sc.transform(X_val)
             sw      = compute_sample_weight("balanced", y_tr)
 
+            # n_jobs=1 on every estimator: training already runs in asyncio.to_thread
+            # so parallelism is handled at the task level.  Using n_jobs>1 spawns
+            # joblib worker processes that don't inherit Python's warnings filters,
+            # causing hundreds of sklearn UserWarnings per second that flood Railway
+            # logs and trigger rate-limit drops of 400+ messages at a time.
             rf  = RandomForestClassifier(
                 n_estimators=200, max_depth=6, min_samples_leaf=10,
-                n_jobs=-1, random_state=42)
+                n_jobs=1, random_state=42)
             gbm = GradientBoostingClassifier(
                 n_estimators=100, max_depth=4, learning_rate=0.05,
                 subsample=0.8, random_state=42)
@@ -991,11 +1005,12 @@ class GenesisBot:
             if _HAS_LGBM:
                 lgbm_clf = lgb.LGBMClassifier(
                     n_estimators=100, num_leaves=31, learning_rate=0.05,
-                    subsample=0.8, random_state=42, verbose=-1)
+                    subsample=0.8, random_state=42, verbose=-1,
+                    n_jobs=1)
                 estimators.append(("lgbm", lgbm_clf))
 
             from sklearn.ensemble import VotingClassifier
-            vc = VotingClassifier(estimators=estimators, voting="soft")
+            vc = VotingClassifier(estimators=estimators, voting="soft", n_jobs=1)
             vc.fit(X_tr_s, y_tr, sample_weight=sw)
 
             preds     = vc.predict(X_val_s)
@@ -1487,16 +1502,16 @@ class GenesisBot:
             direction = "DOWN"
             prob      = p_down
         else:
-            log.info("[SIGNAL] %s | UP=%.4f DOWN=%.4f | below threshold %.2f",
-                     symbol, p_up, p_down, CONF_THRESHOLD)
+            log.debug("[SIGNAL] %s | UP=%.4f DOWN=%.4f | below threshold %.2f",
+                      symbol, p_up, p_down, CONF_THRESHOLD)
             return None
 
         conf = confluence_score(feat_row, direction, regime)
         oos  = self.model_oos.get(symbol, 0.0)
-        log.info("[SIGNAL] %s | %s prob=%.4f | conf=%d/5 | RSI=%.1f ADX=%.1f | %s | OOS=%.1f%%",
-                 symbol, direction, prob, conf,
-                 feat_row.get("rsi14", 0), feat_row.get("adx", 0),
-                 regime, oos * 100)
+        log.debug("[SIGNAL] %s | %s prob=%.4f | conf=%d/5 | RSI=%.1f ADX=%.1f | %s | OOS=%.1f%%",
+                  symbol, direction, prob, conf,
+                  feat_row.get("rsi14", 0), feat_row.get("adx", 0),
+                  regime, oos * 100)
 
         # High-confidence bypass: when the model is both highly confident AND
         # well-validated out-of-sample, trust it directly.  Directional sub-signals
@@ -1509,7 +1524,7 @@ class GenesisBot:
                      symbol, prob, HIGH_CONF_BYPASS_PROB, oos * 100,
                      HIGH_CONF_BYPASS_OOS * 100)
         elif conf < MIN_CONFLUENCE:
-            log.info("[SKIP] %s confluence %d < %d", symbol, conf, MIN_CONFLUENCE)
+            log.debug("[SKIP] %s confluence %d < %d", symbol, conf, MIN_CONFLUENCE)
             return None
 
         return {"direction": direction, "prob": prob,
@@ -1803,7 +1818,7 @@ class GenesisBot:
         sym_wr   = self._symbol_wr(symbol)
         # For multiplier contracts the status stays "open" even when closed via
         # SL/TP — is_sold=1 is the actual close signal.  Show a meaningful label.
-        raw_status = poc.get("status", "?")
+        raw_status = poc.get("status") or "?"
         if int(poc.get("is_sold", 0)) and raw_status == "open":
             close_reason = poc.get("exit_tick_display_value") or "SL/TP"
             display_status = f"sold ({close_reason})"

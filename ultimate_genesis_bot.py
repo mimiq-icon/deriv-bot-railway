@@ -144,25 +144,37 @@ TG_TOKEN: str   = _env("TG_TOKEN", "")
 TG_CHAT_ID: str = _env("TG_CHAT_ID", "")
 
 # Model thresholds
-MIN_OOS_ACC: float     = _envf("MIN_OOS_ACC", "0.505")    # 50.5 % out-of-sample
-MIN_MINORITY_PCT: float = _envf("MIN_MINORITY_PCT", "0.01") # 5 % minority class
+MIN_OOS_ACC: float     = _envf("MIN_OOS_ACC", "0.54")     # 54 % out-of-sample (was 50.5 % — too close to coin-flip)
+MIN_MINORITY_PCT: float = _envf("MIN_MINORITY_PCT", "0.01") # 1 % minority class
 MIN_CONFLUENCE: int    = _envi("MIN_CONFLUENCE", "3")       # signals out of 5
-CONF_THRESHOLD: float  = _envf("CONF_THRESHOLD", "0.52")   # model prob threshold
+CONF_THRESHOLD: float  = _envf("CONF_THRESHOLD", "0.56")   # model prob threshold (was 0.52 — too weak)
 MIN_KELLY: float       = _envf("MIN_KELLY", "0.02")         # min Kelly fraction
 
 # High-confidence confluence bypass.
-# When BOTH thresholds are met, the confluence gate is skipped — the ML ensemble
-# is trusted directly.  Simple directional sub-signals cannot capture non-obvious
-# patterns (e.g. extreme-oversold continuation) that a high-OOS model has learned.
-# Directional confluence still applies for moderate-confidence signals.
-# Set either to 1.0 in Railway Variables to disable the bypass entirely.
-HIGH_CONF_BYPASS_PROB: float = _envf("HIGH_CONF_BYPASS_PROB", "0.90")  # prob ≥ this
-HIGH_CONF_BYPASS_OOS:  float = _envf("HIGH_CONF_BYPASS_OOS",  "0.70")  # OOS ≥ this
+# When BOTH prob and OOS thresholds are met, the standard MIN_CONFLUENCE gate is
+# relaxed — but NOT removed entirely.  HIGH_CONF_MIN_CONFLUENCE is a hard floor:
+# even the most confident model must have ≥ this many directional signals in
+# agreement.  Previously the bypass allowed 0/1 confluence (4-5 indicators
+# directly opposing the signal), which caused consistent losing trades.
+# Set HIGH_CONF_BYPASS_PROB or HIGH_CONF_BYPASS_OOS to 1.0 to disable bypass.
+HIGH_CONF_BYPASS_PROB:    float = _envf("HIGH_CONF_BYPASS_PROB",    "0.90")  # prob ≥ this
+HIGH_CONF_BYPASS_OOS:     float = _envf("HIGH_CONF_BYPASS_OOS",     "0.72")  # OOS ≥ this (was 0.70)
+HIGH_CONF_MIN_CONFLUENCE: int   = _envi("HIGH_CONF_MIN_CONFLUENCE", "2")     # hard floor even with bypass
 
 # Win-rate Bayesian prior
 WR_WINDOW: int          = 20
 WR_PRIOR: float         = 0.55
 WR_PRIOR_STRENGTH: float = 3.0
+
+# Per-symbol win-rate floor.  After ≥5 trades on a symbol, if the Bayesian
+# posterior WR falls below this level the symbol is suspended until it recovers.
+# Prevents the bot from continually trading a broken signal stream.
+MIN_SYMBOL_WR: float = _envf("MIN_SYMBOL_WR", "0.38")  # suspend symbol if WR drops below 38 %
+
+# After 3+ consecutive losses on a symbol, SYMBOL_COOLDOWN is multiplied by
+# |streak| × this factor for an escalating pause.
+# e.g. streak=-3, SYMBOL_COOLDOWN=120s → 120 × 3 × 3.0 = 1080s (~18 min).
+STREAK_COOLDOWN_MULT: float = _envf("STREAK_COOLDOWN_MULT", "3.0")
 
 # Risk
 MAX_DAILY_LOSS_PCT: float    = _envf("MAX_DAILY_LOSS_PCT", "0.10")   # 10 % of day-start bal
@@ -1460,6 +1472,18 @@ class GenesisBot:
         if symbol not in self.models:
             return None
 
+        # ── Bayesian WR gate ──────────────────────────────────────────────────
+        # Suspend a symbol whose recent trade outcomes show a sustained losing
+        # pattern.  Only applied once ≥5 trades have been recorded so the prior
+        # has meaningful data to work with.
+        hist = self.symbol_results.get(symbol, deque())
+        if len(hist) >= 5:
+            sym_wr = self._symbol_wr(symbol)
+            if sym_wr < MIN_SYMBOL_WR:
+                log.debug("[SKIP] %s WR=%.1f%% < MIN_SYMBOL_WR=%.0f%% — suspended",
+                          symbol, sym_wr * 100, MIN_SYMBOL_WR * 100)
+                return None
+
         df = self.candles.get(symbol, pd.DataFrame())
         if df.shape[0] < MIN_CANDLES_TO_TRADE:
             return None
@@ -1514,15 +1538,30 @@ class GenesisBot:
                   regime, oos * 100)
 
         # High-confidence bypass: when the model is both highly confident AND
-        # well-validated out-of-sample, trust it directly.  Directional sub-signals
-        # are cruder tools that can't capture complex patterns (e.g. extreme-oversold
-        # continuation after a bounce) that a high-OOS ensemble has learned.
+        # well-validated out-of-sample, the standard MIN_CONFLUENCE gate is
+        # relaxed — but NOT removed entirely.  HIGH_CONF_MIN_CONFLUENCE is a
+        # hard floor: even the most confident model must have at least that many
+        # directional signals in agreement.
+        #
+        # ROOT-CAUSE FIX: the previous code set bypass = True then did nothing
+        # with the confluence score, allowing 1/5 (and even 0/5) confluence
+        # trades through.  When 4/5 sub-signals directly oppose the direction,
+        # that is a meaningful veto regardless of model confidence.  The ML is
+        # good; it is not infallible, and extreme disagreement from independent
+        # indicators is a reliable staleness/overfitting signal.
         high_conf_bypass = (prob >= HIGH_CONF_BYPASS_PROB and oos >= HIGH_CONF_BYPASS_OOS)
         if high_conf_bypass:
-            log.info("[SIGNAL] %s | HIGH_CONF bypass (prob=%.2f≥%.2f, OOS=%.1f%%≥%.0f%%) "
-                     "— skipping confluence gate",
-                     symbol, prob, HIGH_CONF_BYPASS_PROB, oos * 100,
-                     HIGH_CONF_BYPASS_OOS * 100)
+            if conf < HIGH_CONF_MIN_CONFLUENCE:
+                log.debug("[SKIP] %s HIGH_CONF bypass rejected — confluence %d < hard floor %d "
+                          "(≥%d indicators oppose direction)",
+                          symbol, conf, HIGH_CONF_MIN_CONFLUENCE,
+                          5 - conf)
+                return None
+            log.info("[SIGNAL] %s | HIGH_CONF bypass (prob=%.2f≥%.2f OOS=%.1f%%≥%.0f%%) "
+                     "— confluence relaxed to floor %d (actual=%d/5)",
+                     symbol, prob, HIGH_CONF_BYPASS_PROB,
+                     oos * 100, HIGH_CONF_BYPASS_OOS * 100,
+                     HIGH_CONF_MIN_CONFLUENCE, conf)
         elif conf < MIN_CONFLUENCE:
             log.debug("[SKIP] %s confluence %d < %d", symbol, conf, MIN_CONFLUENCE)
             return None
@@ -1567,7 +1606,16 @@ class GenesisBot:
             return  # Deriv told us this instrument is closed — wait it out silently
         if now - self.last_trade_time < GLOBAL_COOLDOWN:
             return
-        if now - self.symbol_last_trade.get(symbol, 0) < SYMBOL_COOLDOWN:
+
+        # Escalating symbol cooldown: each consecutive loss on this symbol
+        # multiplies the cooldown by |streak| × STREAK_COOLDOWN_MULT.
+        # streak=-3 → 120 × 3 × 3 = 1080s (~18 min); streak=-4 → ~24 min.
+        # This prevents the bot from hammering a symbol that is clearly losing.
+        streak = self.symbol_streak.get(symbol, 0)
+        effective_cooldown = SYMBOL_COOLDOWN
+        if streak <= -3:
+            effective_cooldown = SYMBOL_COOLDOWN * abs(streak) * STREAK_COOLDOWN_MULT
+        if now - self.symbol_last_trade.get(symbol, 0) < effective_cooldown:
             return
 
         self.placing.add(symbol)

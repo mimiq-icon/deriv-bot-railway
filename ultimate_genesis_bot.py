@@ -170,11 +170,13 @@ WR_PRIOR_STRENGTH: float = 3.0
 # posterior WR falls below this level the symbol is suspended until it recovers.
 # Prevents the bot from continually trading a broken signal stream.
 MIN_SYMBOL_WR: float = _envf("MIN_SYMBOL_WR", "0.38")  # suspend symbol if WR drops below 38 %
+MIN_WR_GATE_N: int   = _envi("MIN_WR_GATE_N", "5")     # min trades before WR gate activates
 
 # After 3+ consecutive losses on a symbol, SYMBOL_COOLDOWN is multiplied by
 # |streak| × this factor for an escalating pause.
 # e.g. streak=-3, SYMBOL_COOLDOWN=120s → 120 × 3 × 3.0 = 1080s (~18 min).
-STREAK_COOLDOWN_MULT: float = _envf("STREAK_COOLDOWN_MULT", "3.0")
+STREAK_COOLDOWN_MULT:  float = _envf("STREAK_COOLDOWN_MULT",  "3.0")
+STREAK_COOLDOWN_START: int   = _envi("STREAK_COOLDOWN_START", "3")
 
 # Risk
 MAX_DAILY_LOSS_PCT: float    = _envf("MAX_DAILY_LOSS_PCT", "0.10")   # 10 % of day-start bal
@@ -935,6 +937,10 @@ class GenesisBot:
 
     # ── Stake calculation ─────────────────────────────────────────────────────
 
+    def _map_contracts_for(self, symbol: str) -> list:
+        """Return all OpenContract records currently open for a given symbol."""
+        return [rec for rec in self.contracts._map.values() if rec.symbol == symbol]
+
     def _stake_cap(self) -> float:
         for threshold, frac in reversed(STAKE_LADDER):
             if self.profitable_trades >= threshold:
@@ -1477,7 +1483,7 @@ class GenesisBot:
         # pattern.  Only applied once ≥5 trades have been recorded so the prior
         # has meaningful data to work with.
         hist = self.symbol_results.get(symbol, deque())
-        if len(hist) >= 5:
+        if len(hist) >= MIN_WR_GATE_N:
             sym_wr = self._symbol_wr(symbol)
             if sym_wr < MIN_SYMBOL_WR:
                 log.debug("[SKIP] %s WR=%.1f%% < MIN_SYMBOL_WR=%.0f%% — suspended",
@@ -1613,7 +1619,7 @@ class GenesisBot:
         # This prevents the bot from hammering a symbol that is clearly losing.
         streak = self.symbol_streak.get(symbol, 0)
         effective_cooldown = SYMBOL_COOLDOWN
-        if streak <= -3:
+        if streak <= -STREAK_COOLDOWN_START:
             effective_cooldown = SYMBOL_COOLDOWN * abs(streak) * STREAK_COOLDOWN_MULT
         if now - self.symbol_last_trade.get(symbol, 0) < effective_cooldown:
             return
@@ -1944,6 +1950,16 @@ class GenesisBot:
 
                 signal = self._get_signal(symbol)
                 if signal is None:
+                    continue
+
+                # Block opposing-direction trades on the same symbol.
+                # MULTUP + MULTDOWN open simultaneously is a self-cancelling
+                # hedge that just pays spread twice with zero directional edge.
+                direction = signal["direction"]
+                if any(
+                    ("DOWN" in rec.contract_type) != (direction == "DOWN")
+                    for rec in self._map_contracts_for(symbol)
+                ):
                     continue
 
                 asyncio.create_task(
